@@ -1,0 +1,63 @@
+{
+  "instance": {
+    "teachers": [
+      { "id": "t_kovalenko", "name": "Коваленко О.", "available": ["mon.all.1", "mon.all.2", "mon.all.3", "tue.all.1", "tue.all.2", "wed.all.1"], "prefs": {"preferred_days": ["mon"]} },
+      { "id": "t_petrenko", "name": "Петренко І.", "available": ["tue.all.1", "tue.all.2", "tue.all.3", "wed.all.2", "wed.all.3", "thu.all.1", "thu.all.2"], "prefs": {"preferred_days": ["thu"], "avoid_slots": ["tue.all.3"]} },
+      { "id": "t_shevchenko", "name": "Шевченко М.", "available": ["mon.all.2", "mon.all.3", "fri.all.1", "fri.all.2"], "prefs": {"preferred_days": ["fri"]} },
+      { "id": "t_morozov", "name": "Морозов В.", "available": ["wed.all.1", "wed.all.2", "wed.all.3", "thu.all.1", "thu.all.2", "thu.all.3", "fri.all.3"], "prefs": {} },
+      { "id": "t_tkachenko", "name": "Ткаченко Л.", "available": ["mon.all.1", "tue.all.3"], "prefs": {} }
+    ],
+    "groups": [
+      { "id": "g_math_1", "name": "Математика-1", "size": 25 },
+      { "id": "g_math_2", "name": "Математика-2", "size": 28 },
+      { "id": "g_cs_1", "name": "Комп. науки-1", "size": 30 },
+      { "id": "g_cs_1a", "name": "КН-1 (підгр. А)", "size": 15, "parentGroupId": "g_cs_1" },
+      { "id": "g_cs_1b", "name": "КН-1 (підгр. Б)", "size": 15, "parentGroupId": "g_cs_1" },
+      { "id": "g_hist_1", "name": "Історія-1", "size": 40, "unavailable": ["fri.all.1", "fri.all.2", "fri.all.3"] },
+      { "id": "g_phys_1", "name": "Фізика-1", "size": 22, "unavailable": ["fri.all.1", "fri.all.2", "fri.all.3"] }
+    ],
+    "rooms": [
+      { "id": "r101", "name": "Ауд. 101", "capacity": 30 },
+      { "id": "r102_lab", "name": "Лаб. 102", "capacity": 15 },
+      { "id": "r201", "name": "Ауд. 201", "capacity": 35 },
+      { "id": "r300_lec", "name": "Велика лекційна 300", "capacity": 100 }
+    ],
+    "courses": [
+      { "id": "c_calculus", "name": "Вища математика (Лекція)", "groupIds": ["g_math_1", "g_math_2", "g_cs_1"], "teacherId": "t_morozov", "countPerWeek": 1, "frequency": "weekly" },
+      { "id": "c_history", "name": "Історія України (Лекція)", "groupIds": ["g_hist_1", "g_phys_1"], "teacherId": "t_shevchenko", "countPerWeek": 1, "frequency": "weekly" },
+      { "id": "c_prog_laba", "name": "Програмування (Лаб. А)", "groupIds": ["g_cs_1a"], "teacherId": "t_petrenko", "countPerWeek": 1, "frequency": "even" },
+      { "id": "c_prog_labb", "name": "Програмування (Лаб. Б)", "groupIds": ["g_cs_1b"], "teacherId": "t_petrenko", "countPerWeek": 1, "frequency": "odd" },
+      { "id": "c_algebra", "name": "Алгебра (Семінар)", "groupIds": ["g_math_1"], "teacherId": "t_kovalenko", "countPerWeek": 2, "frequency": "weekly" },
+      { "id": "c_discrete", "name": "Дискретна математика", "groupIds": ["g_cs_1"], "teacherId": "t_tkachenko", "countPerWeek": 1, "frequency": "weekly" },
+      { "id": "c_physics", "name": "Фізика (Семінар)", "groupIds": ["g_phys_1"], "teacherId": "t_morozov", "countPerWeek": 1, "frequency": "weekly" }
+    ],
+    "timeslots": [
+        "mon.all.1", "mon.all.2", "mon.all.3",
+        "tue.all.1", "tue.all.2", "tue.all.3",
+        "wed.all.1", "wed.all.2", "wed.all.3",
+        "thu.all.1", "thu.all.2", "thu.all.3",
+        "fri.all.1", "fri.all.2", "fri.all.3",
+        "tue.even.1", "tue.odd.1"
+    ],
+    "policy": {
+      "soft_weights": {}
+    }
+  },
+  "params": {
+    "timeLimitSec": 1
+  },
+  "focus_assignment": {
+    "courseId": "c_physics",
+    "roomId": "r300_lec",
+    "timeslot": "mon.all.3"
+  },
+  "base": [
+    {"courseId":"c_calculus","teacherId":"t_morozov","roomId":"r300_lec","timeslot":"wed.all.2","groupIds":["g_math_1","g_math_2","g_cs_1"]},
+    {"courseId":"c_history","teacherId":"t_shevchenko","roomId":"r300_lec","timeslot":"mon.all.3","groupIds":["g_hist_1","g_phys_1"]},
+    {"courseId":"c_prog_laba","teacherId":"t_petrenko","roomId":"r102_lab","timeslot":"thu.all.2","groupIds":["g_cs_1a"]},
+    {"courseId":"c_prog_labb","teacherId":"t_petrenko","roomId":"r102_lab","timeslot":"thu.all.1","groupIds":["g_cs_1b"]},
+    {"courseId":"c_algebra","teacherId":"t_kovalenko","roomId":"r101","timeslot":"mon.all.3","groupIds":["g_math_1"]},
+    {"courseId":"c_algebra","teacherId":"t_kovalenko","roomId":"r300_lec","timeslot":"tue.all.2","groupIds":["g_math_1"]},
+    {"courseId":"c_discrete","teacherId":"t_tkachenko","roomId":"r101","timeslot":"mon.all.1","groupIds":["g_cs_1"]}
+  ]
+}

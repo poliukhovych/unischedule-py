@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+ortools
+pydantic
+python-dotenv
+redis
+rq

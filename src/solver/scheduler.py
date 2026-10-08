@@ -1,7 +1,26 @@
 import collections
+import os
+import time
 from ortools.sat.python import cp_model
 from src.schemas import request as schemas_request
 from src.schemas import response as schemas_response
+
+# A weekly class runs every week ("all" slots); odd/even classes only in their own slots.
+ALLOWED_WEEKS = {"weekly": ("all",), "odd": ("odd",), "even": ("even",)}
+
+# Each CP-SAT worker keeps its own copy of the model: ~550 MB with 1 worker, ~850 MB with 2,
+# ~1 GB with 4 for the seed data. 0 means one worker per CPU.
+NUM_WORKERS = int(os.getenv("SOLVER_NUM_WORKERS", "2"))
+
+
+def expand_every_week(slots) -> set:
+    """Availability given as "day.all.N" also covers "day.odd.N" and "day.even.N"."""
+    result = set(slots)
+    for ts in slots:
+        day, week, n = ts.split('.')
+        if week == "all":
+            result.update((f"{day}.odd.{n}", f"{day}.even.{n}"))
+    return result
 
 
 class ScheduleSolver:
@@ -28,84 +47,114 @@ class ScheduleSolver:
             else:
                 self.group_to_main_group[group.id] = group.id
 
+        # "day.all.N" happens every week, so it overlaps both "day.odd.N" and "day.even.N";
+        # odd and even never overlap. Each set below is a group of slots that can't share a resource.
+        by_pair = collections.defaultdict(lambda: collections.defaultdict(list))
+        for ts in self.instance.timeslots:
+            day, week, slot_num = ts.split('.')
+            by_pair[(day, slot_num)][week].append(ts)
+        self.overlapping_slot_sets = []
+        for weeks in by_pair.values():
+            every_week = weeks.get('all', [])
+            parts = [weeks[w] for w in ('odd', 'even') if weeks.get(w)]
+            for part in parts or [[]]:
+                if every_week + part:
+                    self.overlapping_slot_sets.append(every_week + part)
+
     def solve(self, base: list = None, masks: list = None) -> schemas_response.JobResult:
+        deadline = time.monotonic() + self.params.timeLimitSec
         self._create_variables()
         self._add_hard_constraints()
-        self._add_soft_constraints_objective()
         if base or masks:
             self._apply_masks(base, masks)
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = self.params.timeLimitSec
-        solver.parameters.random_seed = self.params.seed
 
-        status = solver.Solve(self.model)
-
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return self._process_results(solver, status)
-        else:
+        # Phase 1: any valid schedule. With the objective attached CP-SAT can spend the whole
+        # time limit without finding a single solution on a slow CPU.
+        first = self._new_solver(max(1.0, deadline - time.monotonic()))
+        status = first.Solve(self.model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return schemas_response.JobResult(
                 assignments=[],
                 objective=-1,
-                status="infeasible",
+                status="timeout" if status == cp_model.UNKNOWN else "infeasible",
                 violations=[],
                 stats=schemas_response.Stats(
-                    solve_time_sec=solver.WallTime(),
-                    status=solver.StatusName(status)
+                    solve_time_sec=first.WallTime(),
+                    status=first.StatusName(status)
                 )
             )
 
+        # Phase 2: improve soft constraints from that starting point in the remaining time.
+        self._add_soft_constraints_objective()
+        remaining = deadline - time.monotonic()
+        if remaining >= 1:
+            # Hint only the chosen assignments: hinting all ~10^5 vars makes CP-SAT overrun its time limit
+            for var in self.assignments.values():
+                if first.Value(var):
+                    self.model.AddHint(var, 1)
+            second = self._new_solver(remaining)
+            status2 = second.Solve(self.model)
+            if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                return self._process_results(second, status2)
+        # Phase 1 had no objective, so its soft-constraint cost is unknown
+        return self._process_results(first, status, objective=-1)
+
+    def _new_solver(self, time_limit: float) -> cp_model.CpSolver:
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = time_limit
+        solver.parameters.random_seed = self.params.seed
+        solver.parameters.num_workers = NUM_WORKERS
+        return solver
+
     def _create_variables(self):
+        # Only combinations that can ever be 1 get a variable: the full course x room x slot
+        # cross product is ~240k vars for the seed data and needs >1 GB RAM in CP-SAT.
+        all_slots = set(self.instance.timeslots)
+        self.vars_by_course = collections.defaultdict(list)
+        self.vars_by_room_slot = collections.defaultdict(list)
+        self.vars_by_teacher_slot = collections.defaultdict(list)
+        self.vars_by_main_group_slot = collections.defaultdict(list)
         for c in self.instance.courses:
-            for r in self.instance.rooms:
-                for ts in self.instance.timeslots:
-                    var_name = f"assign_{c.id}_{r.id}_{ts}"
-                    self.assignments[(c.id, r.id, ts)] = self.model.NewBoolVar(var_name)
+            teacher = self.teachers_map.get(c.teacherId)
+            available = expand_every_week(teacher.available) if teacher else all_slots
+            blocked = set()
+            for gid in c.groupIds:
+                group = self.groups_map.get(gid)
+                if group and group.unavailable:
+                    blocked.update(expand_every_week(group.unavailable))
+            weeks = ALLOWED_WEEKS.get(c.frequency, ("all",))
+            slots = [ts for ts in self.instance.timeslots
+                     if ts.split('.')[1] in weeks and ts in available and ts not in blocked]
+            total_size = sum(self.groups_map[gid].size for gid in c.groupIds)
+            rooms = [r for r in self.instance.rooms if r.capacity >= total_size]
+            main_groups = {self.group_to_main_group.get(gid) for gid in c.groupIds}
+            for r in rooms:
+                for ts in slots:
+                    var = self.model.NewBoolVar(f"assign_{c.id}_{r.id}_{ts}")
+                    self.assignments[(c.id, r.id, ts)] = var
+                    self.vars_by_course[c.id].append(var)
+                    self.vars_by_room_slot[(r.id, ts)].append(var)
+                    self.vars_by_teacher_slot[(c.teacherId, ts)].append(var)
+                    for main in main_groups:
+                        self.vars_by_main_group_slot[(main, ts)].append(var)
 
     def _add_hard_constraints(self):
         for c in self.instance.courses:
-            self.model.Add(sum(self.assignments[(c.id, r.id, ts)] for r in self.instance.rooms for ts in
-                               self.instance.timeslots) == c.countPerWeek)
-        for ts in self.instance.timeslots:
-            for r in self.instance.rooms:
-                self.model.AddAtMostOne(self.assignments[(c.id, r.id, ts)] for c in self.instance.courses)
-            for t in self.instance.teachers:
-                courses_for_teacher = [c for c in self.instance.courses if c.teacherId == t.id]
-                self.model.AddAtMostOne(
-                    [self.assignments[(c.id, r.id, ts)] for c in courses_for_teacher for r in self.instance.rooms])
-            for g in self.instance.groups:
-                courses_for_group = [c for c in self.instance.courses if any(
-                    self.group_to_main_group.get(gid) == self.group_to_main_group.get(g.id) for gid in c.groupIds)]
-                self.model.AddAtMostOne(
-                    [self.assignments[(c.id, r.id, ts)] for c in courses_for_group for r in self.instance.rooms])
-        for c in self.instance.courses:
-            total_size = sum(self.groups_map[gid].size for gid in c.groupIds)
-            for r in self.instance.rooms:
-                if r.capacity < total_size:
-                    for ts in self.instance.timeslots:
-                        self.model.Add(self.assignments[(c.id, r.id, ts)] == 0)
-        for t in self.instance.teachers:
-            unavailable_slots = set(self.instance.timeslots) - set(t.available)
-            for c in self.instance.courses:
-                if c.teacherId == t.id:
-                    for ts in unavailable_slots:
-                        for r in self.instance.rooms:
-                            self.model.Add(self.assignments[(c.id, r.id, ts)] == 0)
-        for g in self.instance.groups:
-            if g.unavailable:
-                for c in self.instance.courses:
-                    if g.id in c.groupIds:
-                        for ts in g.unavailable:
-                            if ts in self.instance.timeslots:
-                                for r in self.instance.rooms:
-                                    self.model.Add(self.assignments[(c.id, r.id, ts)] == 0)
-        for c in self.instance.courses:
-            if c.frequency != "weekly":
-                allowed_weeks = ["even", "all"] if c.frequency == "even" else ["odd", "all"]
-                for ts in self.instance.timeslots:
-                    _, week, _ = ts.split('.')
-                    if week not in allowed_weeks:
-                        for r in self.instance.rooms:
-                            self.model.Add(self.assignments[(c.id, r.id, ts)] == 0)
+            course_vars = self.vars_by_course[c.id]
+            if course_vars:
+                self.model.Add(sum(course_vars) == c.countPerWeek)
+            elif c.countPerWeek > 0:
+                self.model.AddBoolOr([])  # no room/slot fits this course at all -> infeasible
+        teacher_ids = {c.teacherId for c in self.instance.courses}
+        main_group_ids = set(self.group_to_main_group.values())
+        for slots in self.overlapping_slot_sets:
+            for index, keys in ((self.vars_by_room_slot, self.rooms_map.keys()),
+                                (self.vars_by_teacher_slot, teacher_ids),
+                                (self.vars_by_main_group_slot, main_group_ids)):
+                for key in keys:
+                    lits = [v for ts in slots for v in index.get((key, ts), [])]
+                    if len(lits) > 1:
+                        self.model.AddAtMostOne(lits)
 
     def _add_soft_constraints_objective(self):
         soft_constraints = []
@@ -113,81 +162,57 @@ class ScheduleSolver:
         if weights.teacher_avoid_slots_penalty > 0:
             for t in self.instance.teachers:
                 if t.prefs and t.prefs.avoid_slots:
-                    for c in self.instance.courses:
-                        if c.teacherId == t.id:
-                            for ts in t.prefs.avoid_slots:
-                                if ts in self.instance.timeslots:
-                                    for r in self.instance.rooms:
-                                        soft_constraints.append(
-                                            self.assignments[(c.id, r.id, ts)] * weights.teacher_avoid_slots_penalty)
+                    for ts in expand_every_week(t.prefs.avoid_slots):
+                        for var in self.vars_by_teacher_slot.get((t.id, ts), []):
+                            soft_constraints.append(var * weights.teacher_avoid_slots_penalty)
         if weights.teacher_preferred_days_penalty > 0:
             for t in self.instance.teachers:
                 if t.prefs and t.prefs.preferred_days:
-                    non_preferred_days = {ts.split('.')[0] for ts in self.instance.timeslots} - set(
-                        t.prefs.preferred_days)
-                    for c in self.instance.courses:
-                        if c.teacherId == t.id:
-                            for day in non_preferred_days:
-                                for week in ["even", "odd", "all"]:
-                                    for ts in self.parsed_timeslots.get((day, week), []):
-                                        for r in self.instance.rooms:
-                                            soft_constraints.append(self.assignments[(c.id, r.id,
-                                                                                      ts)] * weights.teacher_preferred_days_penalty)
-        if weights.windows_penalty > 0:
-            for g in self.instance.groups:
-                if not g.parentGroupId:
-                    for day in {ts.split('.')[0] for ts in self.instance.timeslots}:
-                        for week in ["even", "odd", "all"]:
-                            slots_for_day = sorted(
-                                [ts for ts in self.instance.timeslots if ts.startswith(f"{day}.{week}.")],
-                                key=lambda x: int(x.split('.')[2]))
-                            if len(slots_for_day) > 2:
-                                for i in range(len(slots_for_day) - 2):
-                                    s1, s2, s3 = slots_for_day[i], slots_for_day[i + 1], slots_for_day[i + 2]
-                                    class_at_s1, no_class_at_s2, class_at_s3, window = (
-                                        self.model.NewBoolVar(f"class_at_{g.id}_{s1}"),
-                                        self.model.NewBoolVar(f"no_class_at_{g.id}_{s2}"),
-                                        self.model.NewBoolVar(f"class_at_{g.id}_{s3}"),
-                                        self.model.NewBoolVar(f"window_{g.id}_{s2}"))
-                                    self.model.Add(sum(
-                                        self.assignments[(c.id, r.id, s1)] for c in self.instance.courses if
-                                        g.id in c.groupIds for r in self.instance.rooms) > 0).OnlyEnforceIf(class_at_s1)
-                                    self.model.Add(sum(
-                                        self.assignments[(c.id, r.id, s1)] for c in self.instance.courses if
-                                        g.id in c.groupIds for r in self.instance.rooms) == 0).OnlyEnforceIf(
-                                        class_at_s1.Not())
-                                    self.model.Add(sum(
-                                        self.assignments[(c.id, r.id, s2)] for c in self.instance.courses if
-                                        g.id in c.groupIds for r in self.instance.rooms) == 0).OnlyEnforceIf(
-                                        no_class_at_s2)
-                                    self.model.Add(sum(
-                                        self.assignments[(c.id, r.id, s2)] for c in self.instance.courses if
-                                        g.id in c.groupIds for r in self.instance.rooms) > 0).OnlyEnforceIf(
-                                        no_class_at_s2.Not())
-                                    self.model.Add(sum(
-                                        self.assignments[(c.id, r.id, s3)] for c in self.instance.courses if
-                                        g.id in c.groupIds for r in self.instance.rooms) > 0).OnlyEnforceIf(class_at_s3)
-                                    self.model.Add(sum(
-                                        self.assignments[(c.id, r.id, s3)] for c in self.instance.courses if
-                                        g.id in c.groupIds for r in self.instance.rooms) == 0).OnlyEnforceIf(
-                                        class_at_s3.Not())
-                                    self.model.AddBoolAnd([class_at_s1, no_class_at_s2, class_at_s3]).OnlyEnforceIf(
-                                        window)
-                                    soft_constraints.append(window * weights.windows_penalty)
-        if weights.daily_load_balance > 0:
-            days = sorted(list({ts.split('.')[0] for ts in self.instance.timeslots}))
-            for g in self.instance.groups:
-                if not g.parentGroupId:
-                    for week in ["even", "odd"]:
-                        daily_loads = [sum(
-                            self.assignments[(c.id, r.id, ts)] for c in self.instance.courses if g.id in c.groupIds for
-                            r in self.instance.rooms for ts in
-                            self.parsed_timeslots.get((day, week), []) + self.parsed_timeslots.get((day, 'all'), []))
-                                       for day in days]
-                        if len(daily_loads) > 1:
-                            max_load = self.model.NewIntVar(0, len(self.instance.courses), f"max_load_{g.id}_{week}")
-                            self.model.AddMaxEquality(max_load, daily_loads)
-                            soft_constraints.append(max_load * weights.daily_load_balance)
+                    preferred = set(t.prefs.preferred_days)
+                    for ts in self.instance.timeslots:
+                        if ts.split('.')[0] not in preferred:
+                            for var in self.vars_by_teacher_slot.get((t.id, ts), []):
+                                soft_constraints.append(var * weights.teacher_preferred_days_penalty)
+
+        if weights.windows_penalty > 0 or weights.daily_load_balance > 0:
+            days = sorted({ts.split('.')[0] for ts in self.instance.timeslots})
+            pair_nums = sorted({int(ts.split('.')[2]) for ts in self.instance.timeslots})
+            main_groups = [g for g in self.instance.groups if not g.parentGroupId]
+            for g in main_groups:
+                # What the group actually has on an odd / even week: "all" lessons plus that week's ones
+                for week in ("odd", "even"):
+                    occupied = {}
+                    daily_loads = []
+                    for day in days:
+                        day_vars = []
+                        for n in pair_nums:
+                            lits = [v for w in ("all", week)
+                                    for v in self.vars_by_main_group_slot.get((g.id, f"{day}.{w}.{n}"), [])]
+                            day_vars.extend(lits)
+                            if lits:
+                                busy = self.model.NewBoolVar(f"busy_{g.id}_{week}_{day}_{n}")
+                                self.model.AddMaxEquality(busy, lits)
+                                occupied[(day, n)] = busy
+                        daily_loads.append(sum(day_vars) if day_vars else 0)
+                    if weights.windows_penalty > 0:
+                        for day in days:
+                            for i in range(len(pair_nums) - 2):
+                                before = occupied.get((day, pair_nums[i]))
+                                gap = occupied.get((day, pair_nums[i + 1]))
+                                after = occupied.get((day, pair_nums[i + 2]))
+                                if before is None or after is None:
+                                    continue
+                                window = self.model.NewBoolVar(f"window_{g.id}_{week}_{day}_{pair_nums[i + 1]}")
+                                # class before and after with a free pair in between forces window = 1
+                                clause = [before.Not(), after.Not(), window]
+                                if gap is not None:
+                                    clause.append(gap)
+                                self.model.AddBoolOr(clause)
+                                soft_constraints.append(window * weights.windows_penalty)
+                    if weights.daily_load_balance > 0 and len(days) > 1:
+                        max_load = self.model.NewIntVar(0, len(pair_nums), f"max_load_{g.id}_{week}")
+                        self.model.AddMaxEquality(max_load, daily_loads)
+                        soft_constraints.append(max_load * weights.daily_load_balance)
         self.model.Minimize(sum(soft_constraints))
 
     def _apply_masks(self, base: list, masks: list):
@@ -211,7 +236,7 @@ class ScheduleSolver:
                     if key in self.assignments:
                         self.model.Add(self.assignments[key] == 1)
 
-    def _process_results(self, solver: cp_model.CpSolver, status: int) -> schemas_response.JobResult:
+    def _process_results(self, solver: cp_model.CpSolver, status: int, objective: int = None) -> schemas_response.JobResult:
         final_assignments = []
         for (c_id, r_id, ts), var in self.assignments.items():
             if solver.Value(var) == 1:
@@ -221,7 +246,7 @@ class ScheduleSolver:
                                                 groupIds=course.groupIds))
         return schemas_response.JobResult(
             assignments=final_assignments,
-            objective=int(solver.ObjectiveValue()),
+            objective=int(solver.ObjectiveValue()) if objective is None else objective,
             status="solved",
             violations=[],
             stats=schemas_response.Stats(

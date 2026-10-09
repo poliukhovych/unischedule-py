@@ -47,7 +47,7 @@ class JobManager:
             None,
             job_timeout='30m'
         )
-        return job.get_id()
+        return job.id
 
     def start_reoptimize_job(self, instance: schemas_request.Instance, params: schemas_request.Params, base: list, masks: list) -> str:
         job = self.queue.enqueue(
@@ -58,5 +58,5 @@ class JobManager:
             [m.model_dump() for m in masks],
             job_timeout='30m'
         )
-        return job.get_id()
+        return job.id
 

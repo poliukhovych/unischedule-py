@@ -235,6 +235,9 @@ class ScheduleSolver:
                     key = (course_id, room_id, timeslot)
                     if key in self.assignments:
                         self.model.Add(self.assignments[key] == 1)
+                    else:
+                        # Pinned into a room/slot the course can never use -> infeasible, not silently moved
+                        self.model.AddBoolOr([])
 
     def _process_results(self, solver: cp_model.CpSolver, status: int, objective: int = None) -> schemas_response.JobResult:
         final_assignments = []
@@ -282,6 +285,9 @@ def run_solve_task(instance_dict: dict, params_dict: dict, base: list = None, ma
     try:
         instance = schemas_request.Instance.model_validate(instance_dict)
         params = schemas_request.Params.model_validate(params_dict)
+        # The queue carries plain dicts; _apply_masks works with the models
+        base = [schemas_request.BaseAssignment.model_validate(b) for b in base or []]
+        masks = [schemas_request.Mask.model_validate(m) for m in masks or []]
 
         # Create solver and run it
         solver = ScheduleSolver(instance, params)
